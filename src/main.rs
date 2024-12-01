@@ -10,7 +10,6 @@ use embedded_svc::{
     http::{client::Client, Method},
     io::Read,
 };
-use embedded_text::alignment::VerticalAlignment;
 use embedded_text::{
     alignment::HorizontalAlignment,
     style::{HeightMode, TextBoxStyleBuilder},
@@ -73,12 +72,6 @@ fn main() -> Result<()> {
 
     display.init(&mut delay).unwrap();
     display.clear(Rgb565::BLACK).unwrap();
-
-    let text = "Hello, World!\n\
-    A paragraph is a number of lines that end with a manual newline. Paragraph spacing is the \
-    number of pixels between two paragraphs.\n\
-    Lorem Ipsum has been the industry's standard dummy text ever since the 1500s, when \
-    an unknown printer took a galley of type and scrambled it to make a type specimen book.";
 
     let character_style = MonoTextStyle::new(&FONT_6X10, Rgb565::BLUE);
     let textbox_style = TextBoxStyleBuilder::new()
@@ -272,7 +265,7 @@ struct ChunkMatchState {
 }
 
 struct UpdateBoardEntry {
-    title: String,
+    _title: String,
     body: String,
 }
 
@@ -303,7 +296,7 @@ fn handle_chunk(chunk: &str, state: &mut ChunkMatchState) -> Option<UpdateBoardE
             println!("Body: {}", state.body);
             // TODO fix this, horrible horrible code
             return Some(UpdateBoardEntry {
-                title: state.header.clone(),
+                _title: state.header.clone(),
                 body: state.body.clone(),
             });
             // state.header.clear();
