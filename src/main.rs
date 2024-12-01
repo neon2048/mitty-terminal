@@ -1,8 +1,20 @@
 use anyhow::{bail, Result};
 use core::str;
+use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::*;
+use embedded_graphics::{
+    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    primitives::Rectangle,
+};
 use embedded_svc::{
     http::{client::Client, Method},
     io::Read,
+};
+use embedded_text::alignment::VerticalAlignment;
+use embedded_text::{
+    alignment::HorizontalAlignment,
+    style::{HeightMode, TextBoxStyleBuilder},
+    TextBox,
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -11,6 +23,16 @@ use esp_idf_svc::{
     wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi},
 };
 use log::info;
+use std::thread;
+use std::time::Duration;
+
+use esp_idf_hal::delay::FreeRtos;
+use esp_idf_hal::gpio::Gpio0;
+use esp_idf_hal::gpio::PinDriver;
+use esp_idf_hal::prelude::*;
+use esp_idf_hal::spi;
+
+use st7735_lcd;
 
 #[toml_cfg::toml_config]
 pub struct Config {
@@ -27,8 +49,47 @@ fn main() -> Result<()> {
     let peripherals = Peripherals::take().unwrap();
     let sysloop = EspSystemEventLoop::take()?;
 
-    let app_config = CONFIG;
+    let spi = peripherals.spi3;
+    let clk = peripherals.pins.gpio36; // fixed
+    let mosi = peripherals.pins.gpio35; // fixed
+    let miso = Option::<Gpio0>::None; // correct
+    let cs = Some(peripherals.pins.gpio39);
+    let reset = PinDriver::output(peripherals.pins.gpio41)?;
+    let a0 = PinDriver::output(peripherals.pins.gpio2)?;
 
+    let driver_config = Default::default();
+    let spi_config = spi::SpiConfig::new().baudrate(30.MHz().into());
+    let spi =
+        spi::SpiDeviceDriver::new_single(spi, clk, mosi, miso, cs, &driver_config, &spi_config)?;
+
+    let rgb = true;
+    let inverted = false;
+    let width = 128;
+    let height = 160;
+
+    let mut delay = FreeRtos;
+
+    let mut display = st7735_lcd::ST7735::new(spi, a0, reset, rgb, inverted, width, height);
+
+    display.init(&mut delay).unwrap();
+    display.clear(Rgb565::BLACK).unwrap();
+
+    let text = "Hello, World!\n\
+    A paragraph is a number of lines that end with a manual newline. Paragraph spacing is the \
+    number of pixels between two paragraphs.\n\
+    Lorem Ipsum has been the industry's standard dummy text ever since the 1500s, when \
+    an unknown printer took a galley of type and scrambled it to make a type specimen book.";
+
+    let character_style = MonoTextStyle::new(&FONT_6X10, Rgb565::BLUE);
+    let textbox_style = TextBoxStyleBuilder::new()
+        .height_mode(HeightMode::FitToText)
+        .alignment(HorizontalAlignment::Center)
+        .leading_spaces(false)
+        .trailing_spaces(false)
+        .paragraph_spacing(6)
+        .build();
+
+    let app_config = CONFIG;
     // Connect to the Wi-Fi network
     let _wifi = wifi(
         app_config.wifi_ssid,
@@ -37,8 +98,14 @@ fn main() -> Result<()> {
         sysloop,
     )?;
 
-    get("https://mitty-terminal.uwu.ai/")?;
+    if let Ok(Some(entry)) = get("https://mitty-terminal.uwu.ai/") {
+        let bounds = Rectangle::new(Point::new(0, 0), Size::new(128, 0));
+        let text_box =
+            TextBox::with_textbox_style(&entry.body, bounds, character_style, textbox_style);
+        text_box.draw(&mut display).unwrap();
+    }
 
+    thread::sleep(Duration::from_secs(10000));
     Ok(())
 }
 
@@ -113,7 +180,7 @@ pub fn wifi(
     Ok(Box::new(esp_wifi))
 }
 
-fn get(url: impl AsRef<str>) -> Result<()> {
+fn get<'a>(url: impl AsRef<str>) -> Result<Option<UpdateBoardEntry>> {
     // 1. Create a new EspHttpClient. (Check documentation)
     // ANCHOR: connection
     let connection = EspHttpConnection::new(&esp_idf_svc::http::client::Configuration {
@@ -157,17 +224,21 @@ fn get(url: impl AsRef<str>) -> Result<()> {
                     let size_plus_offset = size + offset;
                     match str::from_utf8(&buf[..size_plus_offset]) {
                         Ok(text) => {
-                            handle_chunk(text, &mut state);
+                            if let Some(entry) = handle_chunk(text, &mut state) {
+                                return Ok(Some(entry));
+                            }
                             offset = 0;
                         }
                         Err(error) => {
                             let valid_up_to = error.valid_up_to();
                             unsafe {
                                 // print!("{}", str::from_utf8_unchecked(&buf[..valid_up_to]));
-                                handle_chunk(
+                                if let Some(entry) = handle_chunk(
                                     str::from_utf8_unchecked(&buf[..valid_up_to]),
                                     &mut state,
-                                );
+                                ) {
+                                    return Ok(Some(entry));
+                                }
                             }
                             buf.copy_within(valid_up_to.., 0);
                             offset = size_plus_offset - valid_up_to;
@@ -180,7 +251,7 @@ fn get(url: impl AsRef<str>) -> Result<()> {
         _ => bail!("Unexpected response code: {}", status),
     }
 
-    Ok(())
+    Ok(None)
 }
 
 #[derive(PartialEq, Eq)]
@@ -200,6 +271,11 @@ struct ChunkMatchState {
     body: String,
 }
 
+struct UpdateBoardEntry {
+    title: String,
+    body: String,
+}
+
 impl ChunkMatchState {
     fn new() -> Self {
         Self {
@@ -211,24 +287,30 @@ impl ChunkMatchState {
     }
 }
 
-fn handle_chunk(chunk: &str, state: &mut ChunkMatchState) {
+fn handle_chunk(chunk: &str, state: &mut ChunkMatchState) -> Option<UpdateBoardEntry> {
     let mut cur_chunk = chunk;
     while let Some(rest) = handle_chunk_element(cur_chunk, state) {
         cur_chunk = rest;
 
         if state.current_step == MatchStep::ResultAvailable {
             if state.header.contains("#update-board-archive") {
-                return;
+                return None;
             }
 
             unescape(&mut state.header);
             unescape(&mut state.body);
             println!("Header: {}", state.header);
             println!("Body: {}", state.body);
-            state.header.clear();
-            state.body.clear();
+            // TODO fix this, horrible horrible code
+            return Some(UpdateBoardEntry {
+                title: state.header.clone(),
+                body: state.body.clone(),
+            });
+            // state.header.clear();
+            // state.body.clear();
         }
     }
+    return None;
 }
 
 struct ReplacementItem<'a> {
